@@ -1,0 +1,1414 @@
+USE [SimpleCloudDb]
+GO
+/****** Object:  Table [dbo].[FileChunks]    Script Date: 6/3/2025 2:51:43 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[FileChunks](
+	[Id] [int] IDENTITY(1,1) NOT NULL,
+	[FileIdForUpload] [nvarchar](128) NOT NULL,
+	[ChunkNumber] [int] NOT NULL,
+	[ChunkFilePath] [nvarchar](max) NOT NULL,
+	[UploadedAt] [datetime] NOT NULL,
+ CONSTRAINT [PK_dbo.FileChunks] PRIMARY KEY CLUSTERED 
+(
+	[Id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+/****** Object:  Table [dbo].[Files]    Script Date: 6/3/2025 2:51:43 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[Files](
+	[Id] [int] IDENTITY(1,1) NOT NULL,
+	[Name] [nvarchar](255) NOT NULL,
+	[ContentType] [nvarchar](100) NOT NULL,
+	[Size] [bigint] NOT NULL,
+	[FilePath] [nvarchar](max) NOT NULL,
+	[FolderId] [int] NOT NULL,
+	[UploadedAt] [datetime] NOT NULL,
+	[IsProcessing] [bit] NOT NULL,
+ CONSTRAINT [PK_dbo.Files] PRIMARY KEY CLUSTERED 
+(
+	[Id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+/****** Object:  Table [dbo].[Folders]    Script Date: 6/3/2025 2:51:43 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[Folders](
+	[Id] [int] IDENTITY(1,1) NOT NULL,
+	[Name] [nvarchar](255) NOT NULL,
+	[ParentFolderId] [int] NULL,
+	[CreatedAt] [datetime] NOT NULL,
+ CONSTRAINT [PK_dbo.Folders] PRIMARY KEY CLUSTERED 
+(
+	[Id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+/****** Object:  Table [dbo].[ShareableLinks]    Script Date: 6/3/2025 2:51:43 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[ShareableLinks](
+	[Id] [int] IDENTITY(1,1) NOT NULL,
+	[FileId] [int] NOT NULL,
+	[Token] [nvarchar](100) NOT NULL,
+	[PasswordHash] [nvarchar](max) NULL,
+	[CreatedAt] [datetime] NOT NULL,
+	[ExpiresAt] [datetime] NULL,
+ CONSTRAINT [PK_dbo.ShareableLinks] PRIMARY KEY CLUSTERED 
+(
+	[Id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY],
+UNIQUE NONCLUSTERED 
+(
+	[Token] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+ALTER TABLE [dbo].[Files] ADD  DEFAULT ((0)) FOR [IsProcessing]
+GO
+ALTER TABLE [dbo].[Files]  WITH CHECK ADD  CONSTRAINT [FK_dbo.Files_dbo.Folders_FolderId] FOREIGN KEY([FolderId])
+REFERENCES [dbo].[Folders] ([Id])
+ON DELETE CASCADE
+GO
+ALTER TABLE [dbo].[Files] CHECK CONSTRAINT [FK_dbo.Files_dbo.Folders_FolderId]
+GO
+ALTER TABLE [dbo].[Folders]  WITH CHECK ADD  CONSTRAINT [FK_dbo.Folders_dbo.Folders_ParentFolderId] FOREIGN KEY([ParentFolderId])
+REFERENCES [dbo].[Folders] ([Id])
+GO
+ALTER TABLE [dbo].[Folders] CHECK CONSTRAINT [FK_dbo.Folders_dbo.Folders_ParentFolderId]
+GO
+ALTER TABLE [dbo].[ShareableLinks]  WITH CHECK ADD  CONSTRAINT [FK_dbo.ShareableLinks_dbo.Files_FileId] FOREIGN KEY([FileId])
+REFERENCES [dbo].[Files] ([Id])
+ON DELETE CASCADE
+GO
+ALTER TABLE [dbo].[ShareableLinks] CHECK CONSTRAINT [FK_dbo.ShareableLinks_dbo.Files_FileId]
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+using System.Web.Mvc;
+
+namespace SimpleCloudStorage.Controllers
+{
+    public class BaseController : Controller
+    {
+        protected CloudStorageDbContext db = new CloudStorageDbContext();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                db.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+using System;
+using System.IO;
+using System.Linq;
+using System.Web;
+using System.Web.Mvc;
+using System.Configuration;
+using System.Collections.Generic;
+using System.Threading.Tasks; // For async operations
+
+namespace SimpleCloudStorage.Controllers
+{
+    public class FileController : BaseController
+    {
+        private readonly string _finalUploadPath;
+        private readonly string _tempChunkPath;
+
+        public FileController()
+        {
+            string fileUploadPathSetting = ConfigurationManager.AppSettings["FileUploadPath"];
+            string tempChunkUploadPathSetting = ConfigurationManager.AppSettings["TempChunkUploadPath"];
+
+            if (string.IsNullOrEmpty(fileUploadPathSetting))
+            {
+                // Or handle this error more gracefully, e.g., log and disable uploads
+                throw new ConfigurationErrorsException("Configuration Error: 'FileUploadPath' is not set in appSettings.");
+            }
+            if (string.IsNullOrEmpty(tempChunkUploadPathSetting))
+            {
+                // Or handle this error more gracefully
+                throw new ConfigurationErrorsException("Configuration Error: 'TempChunkUploadPath' is not set in appSettings.");
+            }
+
+            _finalUploadPath = System.Web.Hosting.HostingEnvironment.MapPath(fileUploadPathSetting);
+            _tempChunkPath = System.Web.Hosting.HostingEnvironment.MapPath(tempChunkUploadPathSetting);
+
+            if (_finalUploadPath == null)
+            {
+                throw new ConfigurationErrorsException("Configuration Error: Could not resolve 'FileUploadPath'. Ensure the path starts with '~/' or is a valid absolute path if not application relative.");
+            }
+            if (_tempChunkPath == null)
+            {
+                throw new ConfigurationErrorsException("Configuration Error: Could not resolve 'TempChunkUploadPath'. Ensure the path starts with '~/' or is a valid absolute path if not application relative.");
+            }
+
+            if (!Directory.Exists(_finalUploadPath))
+                Directory.CreateDirectory(_finalUploadPath);
+            if (!Directory.Exists(_tempChunkPath))
+                Directory.CreateDirectory(_tempChunkPath);
+        }
+
+        [HttpPost]
+        public async Task<JsonResult> UploadChunk(HttpPostedFileBase chunk, string fileIdForUpload, int chunkNumber, int totalChunks, string originalFileName, int folderId, long totalFileSize, string fileContentType)
+        {
+            if (chunk == null || chunk.ContentLength == 0)
+            {
+                return Json(new { success = false, message = "Empty chunk received." });
+            }
+
+            try
+            {
+                string chunkDirectory = Path.Combine(_tempChunkPath, fileIdForUpload);
+                if (!Directory.Exists(chunkDirectory))
+                {
+                    Directory.CreateDirectory(chunkDirectory);
+                }
+
+                string chunkFilePath = Path.Combine(chunkDirectory, chunkNumber.ToString());
+                chunk.SaveAs(chunkFilePath); // Save the chunk
+
+                // Record chunk in database
+                var fileChunk = new FileChunk
+                {
+                    FileIdForUpload = fileIdForUpload,
+                    ChunkNumber = chunkNumber,
+                    ChunkFilePath = chunkFilePath, // Store relative or absolute as needed
+                    UploadedAt = DateTime.UtcNow
+                };
+                db.FileChunks.Add(fileChunk);
+                await db.SaveChangesAsync();
+
+                // Check if all chunks are uploaded
+                int chunksUploadedCount = db.FileChunks.Count(fc => fc.FileIdForUpload == fileIdForUpload);
+
+                if (chunksUploadedCount == totalChunks)
+                {
+                    // All chunks received, proceed to merge
+                    return Json(new { success = true, allChunksUploaded = true, fileIdForUpload = fileIdForUpload });
+                }
+
+                return Json(new { success = true, message = string.Format("Chunk {0} of {1} uploaded.", chunkNumber + 1, totalChunks), allChunksUploaded = false });
+            }
+            catch (Exception ex)
+            {
+                // Log exception (ex)
+                return Json(new { success = false, message = "Error processing chunk: " + ex.Message });
+            }
+        }
+
+        [HttpPost]
+        public async Task<JsonResult> CompleteUpload(string fileIdForUpload, string originalFileName, int folderId, long totalFileSize, string fileContentType)
+        {
+            try
+            {
+                var chunks = db.FileChunks
+                               .Where(fc => fc.FileIdForUpload == fileIdForUpload)
+                               .OrderBy(fc => fc.ChunkNumber)
+                               .ToList();
+
+                if (!chunks.Any()) {
+                    return Json(new { success = false, message = "No chunks found for this file ID." });
+                }
+
+                // Sanitize originalFileName to prevent path traversal issues
+                string safeFileName = Path.GetFileName(originalFileName);
+                string finalFilePath = Path.Combine(_finalUploadPath, safeFileName);
+
+                // Handle potential file name conflicts
+                int count = 1;
+                string fileNameOnly = Path.GetFileNameWithoutExtension(finalFilePath);
+                string extension = Path.GetExtension(finalFilePath);
+                while (System.IO.File.Exists(finalFilePath))
+                {
+                    safeFileName = string.Format("{0}({1}){2}", fileNameOnly, count++, extension);
+                    finalFilePath = Path.Combine(_finalUploadPath, safeFileName);
+
+                    //safeFileName = string.Format( fileNameOnly,(count++),extension);
+                    //finalFilePath = Path.Combine(_finalUploadPath, safeFileName);
+                }
+                
+                // Create the file record in the database first, mark as processing
+                var newFile = new SimpleCloudStorage.Models.File
+                {
+                    Name = safeFileName,
+                    ContentType = fileContentType,
+                    Size = totalFileSize,
+                    FilePath = finalFilePath, // Relative path from App_Data/FileUploads
+                    FolderId = folderId,
+                    UploadedAt = DateTime.Now,
+                    IsProcessing = true
+                };
+                db.Files.Add(newFile);
+                await db.SaveChangesAsync(); // Get the ID for the new file
+
+                // Merge chunks
+                using (var destStream = new FileStream(finalFilePath, FileMode.Create))
+                {
+                    foreach (var chunk in chunks)
+                    {
+                        using (var sourceStream = new FileStream(chunk.ChunkFilePath, FileMode.Open, FileAccess.Read))
+                        {
+                            await sourceStream.CopyToAsync(destStream);
+                        }
+                        // Optionally delete individual chunk file after merging
+                        System.IO.File.Delete(chunk.ChunkFilePath);
+                    }
+                }
+                
+                // Clean up chunk directory and DB records
+                string chunkDirectory = Path.Combine(_tempChunkPath, fileIdForUpload);
+                if (Directory.Exists(chunkDirectory))
+                {
+                    Directory.Delete(chunkDirectory, true); // true for recursive delete
+                }
+                db.FileChunks.RemoveRange(chunks);
+
+                // Update file record - mark as not processing
+                newFile.IsProcessing = false;
+                db.Entry(newFile).State = System.Data.Entity.EntityState.Modified;
+                await db.SaveChangesAsync();
+
+                return Json(new { success = true, message = "File uploaded and merged successfully.", fileName = newFile.Name });
+            }
+            catch (Exception ex)
+            {
+                // Log exception (ex)
+                // Consider cleanup for partially merged files or marking the file entry as failed
+                return Json(new { success = false, message = "Error merging chunks: " + ex.Message });
+            }
+        }
+
+
+        public ActionResult Download(int id, string password = null)
+        {
+            var file = db.Files.Find(id);
+            if (file == null || file.IsProcessing)
+            {
+                return HttpNotFound("File not found or is currently being processed.");
+            }
+
+            // This is a basic download. For very large files and resumability,
+            // you'd need to handle Range requests.
+            // IIS can often handle Range requests for static files if configured.
+            // For dynamic content or more control:
+            try
+            {
+                var filePath = file.FilePath; // This should be the full path from DB
+                if (!System.IO.File.Exists(filePath)) {
+                     return HttpNotFound("Physical file not found on server.");
+                }
+
+                // To support range requests for resumable downloads, you'd inspect Request.Headers["Range"]
+                // and adjust the FileStream accordingly. For simplicity, this is a full download.
+                // FileStreamResult handles disposing the stream.
+                FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 4096, useAsync: true);
+                
+                // Set content disposition header to suggest filename to browser
+                var contentDisposition = new System.Net.Mime.ContentDisposition
+                {
+                    FileName = file.Name,
+                    Inline = false, // false = prompt for download, true = try to display in browser
+                };
+                Response.AppendHeader("Content-Disposition", contentDisposition.ToString());
+
+                return new FileStreamResult(fs, file.ContentType);
+            }
+            catch (Exception ex)
+            {
+                // Log error
+                return new HttpStatusCodeResult(System.Net.HttpStatusCode.InternalServerError, "Error serving file.");
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+using System;
+using System.Web.Mvc;
+using System.Linq;
+
+namespace SimpleCloudStorage.Controllers
+{
+    public class FolderController : BaseController
+    {
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult Create(string folderName, int? parentFolderId)
+        {
+            if (string.IsNullOrWhiteSpace(folderName))
+            {
+                TempData["ErrorMessage"] = "Folder name cannot be empty.";
+                return RedirectToAction("Index", "Home", new { folderId = parentFolderId });
+            }
+
+            // Ensure parentFolderId corresponds to an existing folder if not null
+            if (parentFolderId.HasValue && !db.Folders.Any(f => f.Id == parentFolderId.Value))
+            {
+                 TempData["ErrorMessage"] = "Invalid parent folder.";
+                 return RedirectToAction("Index", "Home", new { folderId = (int?)null }); // Redirect to root
+            }
+
+
+            var newFolder = new Folder
+            {
+                Name = folderName,
+                ParentFolderId = parentFolderId,
+                CreatedAt = DateTime.Now
+            };
+
+            db.Folders.Add(newFolder);
+            db.SaveChanges();
+
+            TempData["SuccessMessage"] = "Folder '{folderName}' created successfully.";
+            return RedirectToAction("Index", "Home", new { folderId = parentFolderId ?? newFolder.Id });
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+using SimpleCloudStorage.ViewModels;
+using System.Linq;
+using System.Web.Mvc;
+using System;
+
+namespace SimpleCloudStorage.Controllers
+{
+    public class HomeController : BaseController // Inherit from BaseController
+    {
+        public ActionResult Index(int? folderId)
+        {
+            Folder currentFolder;
+            int? parentOfCurrentFolderId = null;
+
+            if (folderId.HasValue)
+            {
+                currentFolder = db.Folders.Find(folderId.Value);
+                if (currentFolder == null)
+                {
+                    // Handle case where folderId is invalid, redirect to root
+                    return RedirectToAction("Index", new { folderId = (int?)null });
+                }
+                parentOfCurrentFolderId = currentFolder.ParentFolderId;
+            }
+            else
+            {
+                // Root folder logic
+                currentFolder = db.Folders.FirstOrDefault(f => f.ParentFolderId == null && f.Name == "Root");
+                if (currentFolder == null)
+                {
+                    currentFolder = new Folder { Name = "Root", CreatedAt = DateTime.Now, ParentFolderId = null };
+                    db.Folders.Add(currentFolder);
+                    db.SaveChanges();
+                }
+            }
+
+            var viewModel = new FolderViewModel
+            {
+                CurrentFolder = currentFolder,
+                SubFolders = db.Folders.Where(f => f.ParentFolderId == currentFolder.Id).OrderBy(f => f.Name).ToList(),
+                Files = db.Files.Where(f => f.FolderId == currentFolder.Id && !f.IsProcessing).OrderBy(f => f.Name).ToList(),
+                ParentOfCurrentFolderId = parentOfCurrentFolderId
+            };
+
+            return View(viewModel);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+using SimpleCloudStorage.ViewModels;
+using System;
+using System.Linq;
+using System.Web.Mvc;
+using System.Web.Security; // For FormsAuthentication.HashPasswordForStoringInConfigFile
+
+namespace SimpleCloudStorage.Controllers
+{
+    public class ShareableLinkController : BaseController
+    {
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult Create(ShareLinkCreateViewModel model)
+        {
+            if (!ModelState.IsValid)
+            {
+                // This case should ideally be handled by client-side validation or return a proper error JSON
+                return Json(new { success = false, message = "Invalid data." });
+            }
+
+            var file = db.Files.Find(model.FileId);
+            if (file == null || file.IsProcessing)
+            {
+                return Json(new { success = false, message = "File not found or is processing." });
+            }
+
+            var token = Guid.NewGuid().ToString("N"); // N format = 32 digits without hyphens
+            var link = new ShareableLink
+            {
+                FileId = model.FileId,
+                Token = token,
+                PasswordHash = !string.IsNullOrWhiteSpace(model.Password) ?
+                               FormsAuthentication.HashPasswordForStoringInConfigFile(model.Password.Trim(), "SHA1") : null,
+                CreatedAt = DateTime.Now,
+                // ExpiresAt = DateTime.Now.AddDays(7) // Example: Set an expiration date
+            };
+
+            db.ShareableLinks.Add(link);
+            db.SaveChanges();
+
+            var generatedLink = Url.Action("Access", "ShareableLink", new { token = token }, Request.Url.Scheme);
+
+            return Json(new { success = true, link = generatedLink });
+        }
+
+        [HttpGet]
+        public ActionResult Access(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                return HttpNotFound("Link token is missing.");
+            }
+
+            var link = db.ShareableLinks.Include("File") // Eager load the File entity
+                           .FirstOrDefault(l => l.Token == token);
+
+            if (link == null)
+            {
+                return HttpNotFound("Invalid or expired link.");
+            }
+
+            if (link.ExpiresAt.HasValue && link.ExpiresAt < DateTime.Now)
+            {
+                // Optionally remove the expired link from DB
+                // db.ShareableLinks.Remove(link);
+                // db.SaveChanges();
+                return HttpNotFound("This link has expired.");
+            }
+
+            if (link.File == null || link.File.IsProcessing)
+            {
+                return HttpNotFound("The associated file is not available or is being processed.");
+            }
+
+
+            if (!string.IsNullOrEmpty(link.PasswordHash))
+            {
+                // If password protected, show password entry view
+                var viewModel = new ShareLinkAccessViewModel { Link = new ShareableLink { Token = link.Token } }; // Only pass necessary info
+                return View("PasswordProtect", viewModel);
+            }
+
+            // No password, proceed to download
+            return RedirectToAction("Download", "File", new { id = link.FileId });
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public ActionResult PasswordProtect(string token, string password)
+        {
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(password))
+            {
+                TempData["ErrorMessage"] = "Token or password cannot be empty.";
+                // Re-render the view with an error
+                var errorViewModel = new ShareLinkAccessViewModel { Link = new ShareableLink { Token = token }, ErrorMessage = "Token or password cannot be empty." };
+                return View(errorViewModel);
+            }
+
+            var link = db.ShareableLinks.FirstOrDefault(l => l.Token == token);
+            if (link == null || string.IsNullOrEmpty(link.PasswordHash)) // Also check if it's supposed to have a password
+            {
+                return HttpNotFound("Invalid link or no password required.");
+            }
+
+            if (link.ExpiresAt.HasValue && link.ExpiresAt < DateTime.Now)
+            {
+                return HttpNotFound("This link has expired.");
+            }
+
+            var hashedPasswordAttempt = FormsAuthentication.HashPasswordForStoringInConfigFile(password.Trim(), "SHA1");
+
+            if (link.PasswordHash == hashedPasswordAttempt)
+            {
+                return RedirectToAction("Download", "File", new { id = link.FileId });
+            }
+            else
+            {
+                var viewModel = new ShareLinkAccessViewModel { Link = new ShareableLink { Token = token }, ErrorMessage = "Invalid password." };
+                return View(viewModel);
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models; // Your EF Models namespace
+using System.Collections.Generic;
+
+namespace SimpleCloudStorage.ViewModels
+{
+    public class FolderViewModel
+    {
+        public Folder CurrentFolder { get; set; }
+        public List<Folder> SubFolders { get; set; }
+        public List<File> Files { get; set; }
+        public int? ParentOfCurrentFolderId { get; set; } // For ".." navigation
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+using SimpleCloudStorage.Models;
+
+namespace SimpleCloudStorage.ViewModels
+{
+    public class ShareLinkAccessViewModel
+    {
+        public ShareableLink Link { get; set; }
+        public string ErrorMessage { get; set; }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using System.ComponentModel.DataAnnotations;
+
+namespace SimpleCloudStorage.ViewModels
+{
+    public class ShareLinkCreateViewModel
+    {
+        [Required]
+        public int FileId { get; set; }
+        public string FileName { get; set; } // To display in modal
+        public string Password { get; set; }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// home/index.cshtml
+@model SimpleCloudStorage.ViewModels.FolderViewModel
+@{
+    ViewBag.Title = Model.CurrentFolder.Name == "Root" && !Model.CurrentFolder.ParentFolderId.HasValue ? "My Cloud" : Model.CurrentFolder.Name;
+    var currentFolderIdForForms = Model.CurrentFolder.Id; // Ensure this is the ID of the actual folder entity
+}
+
+<style>
+    .file-icon {
+        width: 20px;
+        height: 20px;
+        margin-right: 5px;
+    }
+
+    .folder-actions, .file-actions {
+        display: flex;
+        gap: 10px;
+    }
+
+    #uploadProgressContainer {
+        margin-top: 10px;
+    }
+
+    .progress {
+        height: 20px;
+    }
+
+    .modal {
+        display: none;
+        position: fixed;
+        z-index: 1000;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        overflow: auto;
+        background-color: rgba(0,0,0,0.4);
+    }
+
+    .modal-content {
+        background-color: #fefefe;
+        margin: 15% auto;
+        padding: 20px;
+        border: 1px solid #888;
+        width: 80%;
+        max-width: 500px;
+        border-radius: 8px;
+    }
+
+    .close-button {
+        color: #aaa;
+        float: right;
+        font-size: 28px;
+        font-weight: bold;
+    }
+
+        .close-button:hover, .close-button:focus {
+            color: black;
+            text-decoration: none;
+            cursor: pointer;
+        }
+</style>
+
+<h2>
+    <img src="https://placehold.co/30x30/007bff/white?text=FD" alt="Folder Icon" class="file-icon" /> @ViewBag.Title
+</h2>
+
+<div style="margin-bottom: 20px;">
+    @using (Html.BeginForm("Create", "Folder", FormMethod.Post, new { @class = "form-inline" }))
+    {
+        @Html.AntiForgeryToken()
+        @Html.Hidden("parentFolderId", currentFolderIdForForms)
+        <div class="form-group">
+            <input type="text" name="folderName" class="form-control" placeholder="New folder name" required />
+        </div>
+        <button type="submit" class="btn btn-primary">Create Folder</button>
+    }
+</div>
+
+<div style="margin-bottom: 20px;">
+    <form id="chunkUploadForm" class="form-inline">
+        @Html.Hidden("folderId", currentFolderIdForForms, new { id = "uploadFolderId" })
+        <div class="form-group">
+            <input type="file" name="file" id="fileInput" class="form-control" required />
+        </div>
+        <button type="button" id="uploadButton" class="btn btn-success">Upload File</button>
+    </form>
+    <div id="uploadProgressContainer" style="display:none;">
+        <p>Uploading: <span id="uploadFileName"></span></p>
+        <div class="progress">
+            <div id="uploadProgressBar" class="progress-bar progress-bar-striped active" role="progressbar"
+                 aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" style="width:0%">
+                0%
+            </div>
+        </div>
+        <p id="chunkStatus"></p>
+    </div>
+</div>
+
+
+<table class="table table-hover">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Size</th>
+            <th>Uploaded/Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        @if (Model.ParentOfCurrentFolderId.HasValue || (Model.CurrentFolder.Name != "Root" && Model.CurrentFolder.ParentFolderId.HasValue))
+        {
+            <tr>
+                <td colspan="5">
+                    @Html.ActionLink(".. (Up one level)", "Index", new { folderId = Model.ParentOfCurrentFolderId })
+                </td>
+            </tr>
+        }
+
+        @foreach (var folder in Model.SubFolders)
+        {
+            <tr>
+                <td>
+                    <img src="https://placehold.co/20x20/007bff/white?text=F" alt="Folder" class="file-icon" /> @Html.ActionLink(folder.Name, "Index", new { folderId = folder.Id })
+                </td>
+                <td>Folder</td>
+                <td>-</td>
+                <td>@folder.CreatedAt.ToString("g")</td>
+                <td>@* Folder actions here if needed *@</td>
+            </tr>
+        }
+
+        @foreach (var file in Model.Files)
+        {
+            <tr>
+                <td>
+                    <img src="https://placehold.co/20x20/6c757d/white?text=D" alt="File" class="file-icon" /> @file.Name
+                </td>
+                <td>@file.ContentType</td>
+                <td>@((file.Size / 1024.0 / 1024.0).ToString("F2")) MB</td>
+                <td>@file.UploadedAt.ToString("g")</td>
+                <td class="file-actions">
+                    @Html.ActionLink("Download", "Download", "File", new { id = file.Id }, new { @class = "btn btn-xs btn-info" })
+                    <button class="btn btn-xs btn-warning share-link-btn" data-fileid="@file.Id" data-filename="@file.Name">Share</button>
+                </td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+@if (!Model.SubFolders.Any() && !Model.Files.Any() && !(Model.ParentOfCurrentFolderId.HasValue || (Model.CurrentFolder.Name != "Root" && Model.CurrentFolder.ParentFolderId.HasValue)))
+{
+    <p>This folder is empty.</p>
+}
+
+
+<div id="shareModal" class="modal">
+    <div class="modal-content">
+        <span class="close-button" id="closeShareModal">&times;</span>
+        <h4>Create Shareable Link for <span id="shareModalFileName"></span></h4>
+        @using (Html.BeginForm(null, null, FormMethod.Post, new { id = "shareLinkForm" })) // Dummy form for AntiForgeryToken
+        {
+            @Html.AntiForgeryToken() }
+        <input type="hidden" id="shareFileIdModal" />
+        <div class="form-group">
+            <label for="sharePasswordModal">Password (optional):</label>
+            <input type="password" id="sharePasswordModal" class="form-control" placeholder="Leave blank for no password" />
+        </div>
+        <button id="createShareLinkBtnModal" class="btn btn-primary">Create Link</button>
+        <div id="generatedLinkContainer" style="margin-top:15px; display:none;">
+            <p>Share this link:</p>
+            <input type="text" id="generatedLinkText" class="form-control" readonly />
+            <button id="copyLinkBtn" class="btn btn-secondary btn-sm">Copy</button>
+        </div>
+        <div id="shareError" class="text-danger" style="margin-top:10px;"></div>
+    </div>
+</div>
+
+
+@section scripts {
+    <script>
+$(document).ready(function () {
+    const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB chunks
+
+    $('#uploadButton').on('click', function () {
+        const fileInput = $('#fileInput')[0];
+        if (fileInput.files.length === 0) {
+            alert('Please select a file to upload.');
+            return;
+        }
+        const file = fileInput.files[0];
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const fileIdForUpload = generateGuid(); // Unique ID for this upload session
+        const folderId = $('#uploadFolderId').val();
+
+        $('#uploadFileName').text(file.name);
+        $('#uploadProgressContainer').show();
+        updateProgressBar(0, 'Starting upload...');
+
+        let currentChunk = 0;
+
+        function uploadNextChunk() {
+            if (currentChunk >= totalChunks) {
+                // All chunks sent, now call complete
+                updateProgressBar(100, 'All chunks sent. Finalizing upload...');
+                $.ajax({
+                    url: '@Url.Action("CompleteUpload", "File")',
+                    type: 'POST',
+                    data: {
+                        fileIdForUpload: fileIdForUpload,
+                        originalFileName: file.name,
+                        folderId: folderId,
+                        totalFileSize: file.size,
+                        fileContentType: file.type
+                    },
+                    success: function(response) {
+                        if (response.success) {
+                            updateProgressBar(100, 'Upload complete: ' + response.fileName);
+                            setTimeout(function() { location.reload(); }, 2000);
+                        } else {
+                            updateProgressBar(0, 'Error finalizing: ' + response.message, true);
+                        }
+                    },
+                    error: function(xhr, status, error) {
+                        updateProgressBar(0, 'Error finalizing upload: ' + error, true);
+                    }
+                });
+                return;
+            }
+
+            const start = currentChunk * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, file.size);
+            const chunkBlob = file.slice(start, end);
+            const chunkFormData = new FormData();
+
+            chunkFormData.append('chunk', chunkBlob, file.name + ".chunk" + currentChunk); // Third param for filename is optional for blob
+            chunkFormData.append('fileIdForUpload', fileIdForUpload);
+            chunkFormData.append('chunkNumber', currentChunk);
+            chunkFormData.append('totalChunks', totalChunks);
+            chunkFormData.append('originalFileName', file.name); // Send with each chunk for context
+            chunkFormData.append('folderId', folderId);
+            chunkFormData.append('totalFileSize', file.size);
+            chunkFormData.append('fileContentType', file.type);
+
+
+            updateProgressBar(((currentChunk) / totalChunks) * 100, `Uploading chunk ${currentChunk + 1} of ${totalChunks}...`);
+
+            $.ajax({
+                url: '@Url.Action("UploadChunk", "File")',
+                type: 'POST',
+                data: chunkFormData,
+                processData: false,
+                contentType: false,
+                success: function (response) {
+                    if (response.success) {
+                        currentChunk++;
+                        if (response.allChunksUploaded) { // Server confirms all chunks are there
+                             updateProgressBar(100, 'All chunks received by server. Finalizing upload...');
+                             // Call complete directly
+                             $.ajax({
+                                url: '@Url.Action("CompleteUpload", "File")',
+                                type: 'POST',
+                                data: {
+                                    fileIdForUpload: fileIdForUpload,
+                                    originalFileName: file.name,
+                                    folderId: folderId,
+                                    totalFileSize: file.size,
+                                    fileContentType: file.type
+                                },
+                                success: function(compResponse) {
+                                    if (compResponse.success) {
+                                        updateProgressBar(100, 'Upload complete: ' + compResponse.fileName);
+                                        setTimeout(function() { location.reload(); }, 2000);
+                                    } else {
+                                        updateProgressBar(0, 'Error finalizing: ' + compResponse.message, true);
+                                    }
+                                },
+                                error: function() { updateProgressBar(0, 'Error finalizing upload.', true); }
+                            });
+                        } else {
+                             uploadNextChunk(); // Upload next chunk
+                        }
+                    } else {
+                        updateProgressBar(0, 'Error uploading chunk: ' + response.message, true);
+                        // Implement retry logic here if desired
+                    }
+                },
+                error: function (xhr, status, error) {
+                    updateProgressBar(0, `Error on chunk ${currentChunk + 1}: ${error}. Retrying...`, true);
+                    // Basic retry
+                    setTimeout(uploadNextChunk, 3000);
+                }
+            });
+        }
+        uploadNextChunk(); // Start uploading the first chunk
+    });
+
+    function updateProgressBar(percentage, statusText, isError = false) {
+        const bar = $('#uploadProgressBar');
+        bar.css('width', percentage + '%').attr('aria-valuenow', percentage).text(Math.round(percentage) + '%');
+        $('#chunkStatus').text(statusText);
+        if (isError) {
+            bar.removeClass('progress-bar-success progress-bar-striped active').addClass('progress-bar-danger');
+        } else if (percentage >= 100) {
+            bar.removeClass('progress-bar-striped active progress-bar-danger').addClass('progress-bar-success');
+        } else {
+            bar.removeClass('progress-bar-success progress-bar-danger').addClass('progress-bar-striped active');
+        }
+    }
+
+    function generateGuid() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    // Share Modal Logic
+    var shareModal = document.getElementById("shareModal");
+    var closeShareModalBtn = document.getElementById("closeShareModal");
+
+    $('.share-link-btn').on('click', function () {
+        var fileId = $(this).data('fileid');
+        var fileName = $(this).data('filename');
+        $('#shareFileIdModal').val(fileId);
+        $('#shareModalFileName').text(fileName);
+        $('#sharePasswordModal').val(''); // Clear password field
+        $('#generatedLinkContainer').hide();
+        $('#generatedLinkText').val('');
+        $('#shareError').text('');
+        shareModal.style.display = "block";
+    });
+
+    closeShareModalBtn.onclick = function() {
+        shareModal.style.display = "none";
+    }
+    window.onclick = function(event) {
+        if (event.target == shareModal) {
+            shareModal.style.display = "none";
+        }
+    }
+
+    $('#createShareLinkBtnModal').on('click', function () {
+        var fileId = $('#shareFileIdModal').val();
+        var password = $('#sharePasswordModal').val();
+        var token = $('#shareLinkForm input[name="__RequestVerificationToken"]').val(); // Get AntiForgeryToken
+        $('#shareError').text('');
+
+
+        $.ajax({
+            url: '@Url.Action("Create", "ShareableLink")',
+            type: 'POST',
+            data: {
+                __RequestVerificationToken: token,
+                FileId: fileId,
+                Password: password
+            },
+            success: function (response) {
+                if (response.success) {
+                    $('#generatedLinkText').val(response.link);
+                    $('#generatedLinkContainer').show();
+                } else {
+                    $('#shareError').text(response.message || 'Error creating link.');
+                    $('#generatedLinkContainer').hide();
+                }
+            },
+            error: function () {
+                $('#shareError').text('An unexpected error occurred.');
+                $('#generatedLinkContainer').hide();
+            }
+        });
+    });
+
+    $('#copyLinkBtn').on('click', function() {
+        var copyText = document.getElementById("generatedLinkText");
+        copyText.select();
+        copyText.setSelectionRange(0, 99999); // For mobile devices
+        try {
+            var successful = document.execCommand('copy');
+            var msg = successful ? 'Copied!' : 'Failed to copy';
+            alert(msg); // Replace with a less intrusive notification if desired
+        } catch (err) {
+            alert('Oops, unable to copy');
+        }
+    });
+});
+    </script>
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//shareablelink/passwordprotect.cshtml
+@model SimpleCloudStorage.ViewModels.ShareLinkAccessViewModel
+@{
+ViewBag.Title = "Password Required";
+}
+<div class="container">
+    <h2>Password Required</h2>
+    <p>This file is password protected.Please enter the password to download.</p>
+    @using (Html.BeginForm("PasswordProtect", "ShareableLink", FormMethod.Post, new { @class = "form-horizontal" }))
+{
+        @Html.AntiForgeryToken()
+        @* Original line: @Html.HiddenFor(m => m.Link.Token, new { name = "token" }) *@
+        <input type="hidden" name="token" value="@Model.Link.Token" />
+
+        <div class="form-group">
+            <label for="password" class="col-md-2 control-label">Password:</label>
+            <div class="col-md-10">
+                <input type="password" name="password" id="password" class="form-control" required />
+            </div>
+        </div>
+
+        <div class="form-group">
+            <div class="col-md-offset-2 col-md-10">
+                <button type="submit" class="btn btn-primary">Submit</button>
+            </div>
+        </div>
+}
+    @if (!string.IsNullOrEmpty(Model.ErrorMessage))
+{
+<div class="alert alert-danger" style="margin-top: 15px;">
+@Model.ErrorMessage
+    </div>
+}
+    </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//_layout.cshtml
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>@ViewBag.Title - Simple Cloud Storage</title>
+    @Styles.Render("~/Content/css")
+    @Scripts.Render("~/bundles/modernizr")
+</head>
+<body>
+    <div class="navbar navbar-inverse navbar-fixed-top">
+        <div class="container">
+            <div class="navbar-header">
+                @Html.ActionLink("Simple Cloud", "Index", "Home", new { area = "" }, new { @class = "navbar-brand" })
+            </div>
+        </div>
+    </div>
+    <div class="container body-content">
+        @if (TempData["SuccessMessage"] != null)
+        {
+            <div class="alert alert-success">@TempData["SuccessMessage"]</div>
+        }
+        @if (TempData["ErrorMessage"] != null)
+        {
+            <div class="alert alert-danger">@TempData["ErrorMessage"]</div>
+        }
+        @RenderBody()
+        <hr />
+        <footer>
+            <p>&copy; @DateTime.Now.Year - Simple Cloud Storage</p>
+        </footer>
+    </div>
+    @Scripts.Render("~/bundles/jquery") @Scripts.Render("~/bundles/bootstrap")
+    @RenderSection("scripts", required: false)
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//web.config
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  For more information on how to configure your ASP.NET application, please visit
+  http://go.microsoft.com/fwlink/?LinkId=301880
+  -->
+
+
+
+
+<configuration>
+  <configSections>
+    <section name="entityFramework"
+      type="System.Data.Entity.Internal.ConfigFile.EntityFrameworkSection, EntityFramework, Version=6.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+      requirePermission="false"/>
+  </configSections>
+
+  <appSettings>
+    <add key="webpages:Version" value="3.0.0.0"/>
+    <add key="webpages:Enabled" value="false"/>
+    <add key="ClientValidationEnabled" value="true"/>
+    <add key="UnobtrusiveJavaScriptEnabled" value="true"/>
+    <add key="FileUploadPath" value="~/FileUploads"/>
+    <add key="TempChunkUploadPath" value="~/TempChunkUploads"/>
+  </appSettings>
+
+  <connectionStrings>
+    <add name="CloudStorageDbContext" connectionString="metadata=res://*/Models.CloudStorageModel.csdl|res://*/Models.CloudStorageModel.ssdl|res://*/Models.CloudStorageModel.msl;provider=System.Data.SqlClient;provider connection string=&quot;data source=172.16.251.139;initial catalog=SimpleCloudDb;persist security info=True;user id=sa;password=Welcome1;MultipleActiveResultSets=True;App=EntityFramework&quot;" providerName="System.Data.EntityClient" />
+
+  </connectionStrings>
+
+  <system.web>
+    <compilation debug="true" targetFramework="4.8"/>
+    <!--
+      maxRequestLength is in kilobytes (KB). 2097151 KB = approx 2GB.
+      For 100GB, this value needs to be significantly larger: 100 * 1024 * 1024 = 104857600 KB.
+      executionTimeout is in seconds. 3600 seconds = 1 hour. Increase if needed for very slow uploads.
+    -->
+    <httpRuntime targetFramework="4.8" maxRequestLength="104857600" executionTimeout="10800"/>
+    <authentication mode="None"/>
+  </system.web>
+
+  <system.webServer>
+    <validation validateIntegratedModeConfiguration="false"/>
+    <modules runAllManagedModulesForAllRequests="true"/>
+    <security>
+      <requestFiltering>
+        <!--
+          maxAllowedContentLength is in bytes (B). Default is 30,000,000 (approx 28.6MB).
+          For 100GB: 100 * 1024 * 1024 * 1024 = 107374182400 bytes.
+          However, IIS has a practical limit for maxAllowedContentLength (unsigned int, max ~4GB).
+          For files >4GB, chunking is the ONLY way, and maxAllowedContentLength should be set to allow largest chunk size + overhead.
+          Let's set it to a large value, but rely on chunking. For a 10MB chunk size: 10 * 1024 * 1024 = 10485760.
+          Let's set it to allow for slightly larger chunks, e.g., 100MB: 104857600
+        -->
+        <requestLimits maxAllowedContentLength="104857600"/>
+      </requestFiltering>
+    </security>
+  </system.webServer>
+
+  <runtime>
+    <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+      <dependentAssembly>
+        <assemblyIdentity name="Newtonsoft.Json" culture="neutral" publicKeyToken="30ad4fe6b2a6aeed" />
+        <bindingRedirect oldVersion="0.0.0.0-13.0.0.0" newVersion="13.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Optimization" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-1.1.0.0" newVersion="1.1.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="WebGrease" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="0.0.0.0-1.5.2.14234" newVersion="1.5.2.14234" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Helpers" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.WebPages" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Mvc" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="0.0.0.0-5.2.9.0" newVersion="5.2.9.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="Microsoft.Web.Infrastructure" publicKeyToken="31bf3856ad364e35" culture="neutral" />
+        <bindingRedirect oldVersion="0.0.0.0-2.0.0.0" newVersion="2.0.0.0" />
+      </dependentAssembly>
+    </assemblyBinding>
+  </runtime>
+  <entityFramework>
+    <providers>
+      <provider invariantName="System.Data.SqlClient" type="System.Data.Entity.SqlServer.SqlProviderServices, EntityFramework.SqlServer"/>
+    </providers>
+  </entityFramework>
+</configuration>
+
+
+<!--<configuration>
+  <configSections>
+    --><!-- For more information on Entity Framework configuration, visit http://go.microsoft.com/fwlink/?LinkID=237468 --><!--
+    <section name="entityFramework" type="System.Data.Entity.Internal.ConfigFile.EntityFrameworkSection, EntityFramework, Version=6.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" requirePermission="false" />
+  </configSections>
+  
+  <appSettings>
+    <add key="webpages:Version" value="3.0.0.0" />
+    <add key="webpages:Enabled" value="false" />
+    <add key="ClientValidationEnabled" value="true" />
+    <add key="UnobtrusiveJavaScriptEnabled" value="true" />
+    <add key="FileUploadPath" value="~/App_Data/FileUploads"/>
+    <add key="TempChunkUploadPath" value="~/App_Data/TempChunkUploads"/>
+  </appSettings>
+  <system.web>
+    <compilation debug="true" targetFramework="4.8" />
+    <httpRuntime targetFramework="4.8" />
+  </system.web>
+  <runtime>
+    <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+      <dependentAssembly>
+        <assemblyIdentity name="Newtonsoft.Json" culture="neutral" publicKeyToken="30ad4fe6b2a6aeed" />
+        <bindingRedirect oldVersion="0.0.0.0-13.0.0.0" newVersion="13.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Optimization" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-1.1.0.0" newVersion="1.1.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="WebGrease" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="0.0.0.0-1.5.2.14234" newVersion="1.5.2.14234" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Helpers" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.WebPages" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="System.Web.Mvc" publicKeyToken="31bf3856ad364e35" />
+        <bindingRedirect oldVersion="0.0.0.0-5.2.9.0" newVersion="5.2.9.0" />
+      </dependentAssembly>
+      <dependentAssembly>
+        <assemblyIdentity name="Microsoft.Web.Infrastructure" publicKeyToken="31bf3856ad364e35" culture="neutral" />
+        <bindingRedirect oldVersion="0.0.0.0-2.0.0.0" newVersion="2.0.0.0" />
+      </dependentAssembly>
+    </assemblyBinding>
+  </runtime>
+  <entityFramework>
+    <providers>
+      <provider invariantName="System.Data.SqlClient" type="System.Data.Entity.SqlServer.SqlProviderServices, EntityFramework.SqlServer" />
+    </providers>
+  </entityFramework>
+  <system.webServer>
+    <handlers>
+      <remove name="ExtensionlessUrlHandler-Integrated-4.0" />
+      <remove name="OPTIONSVerbHandler" />
+      <remove name="TRACEVerbHandler" />
+      <add name="ExtensionlessUrlHandler-Integrated-4.0" path="*." verb="*" type="System.Web.Handlers.TransferRequestHandler" preCondition="integratedMode,runtimeVersionv4.0" />
+    </handlers>
+  </system.webServer>
+  <connectionStrings>
+    <add name="CloudStorageDbContext" connectionString="metadata=res://*/Models.CloudStorageModel.csdl|res://*/Models.CloudStorageModel.ssdl|res://*/Models.CloudStorageModel.msl;provider=System.Data.SqlClient;provider connection string=&quot;data source=172.16.251.139;initial catalog=SimpleCloudDb;persist security info=True;user id=sa;password=Welcome1;MultipleActiveResultSets=True;App=EntityFramework&quot;" providerName="System.Data.EntityClient" />
+  </connectionStrings>
+</configuration>-->
+
+
+
+
+
+
+
+
+
+
+
